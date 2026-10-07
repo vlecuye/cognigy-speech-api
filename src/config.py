@@ -11,15 +11,15 @@ class Settings(BaseSettings):
 
     # Google Cloud & Vertex AI settings
     project_id: Optional[str] = "all-in-demo"
-    location: str = "global"
+    location: str = "europe-west1"
 
     # Cognigy Voice Gateway authentication
     # If set, requests must contain 'Authorization: Bearer <cognigy_api_key>'
     cognigy_api_key: Optional[str] = None
 
     # TTS Model Configuration
-    standard_tts_model: str = "gemini-3.8-flash-tts"
-    live_tts_model: str = "gemini-3.1-flash-live-preview"
+    standard_tts_model: str = "gemini-2.5-flash-tts"
+    live_tts_model: str = "gemini-live-2.5-flash-native-audio"
 
     # Default Telephony Audio Settings
     default_voice: str = "Puck"
