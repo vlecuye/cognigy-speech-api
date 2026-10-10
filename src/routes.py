@@ -1,8 +1,10 @@
-"""Cognigy Voice Gateway Custom Speech HTTP routes."""
+"""Cognigy Voice Gateway Custom Speech HTTP and WebSocket routes."""
 
+import asyncio
+import json
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -10,6 +12,7 @@ from src.config import Settings, settings
 from src.audio_utils import build_wav_header
 from src.gemini_tts import GeminiTTSClient
 from src.gemini_live import GeminiLiveClient
+from src.gemini_stt import GeminiSTTClient
 
 logger = logging.getLogger(__name__)
 
@@ -176,3 +179,167 @@ async def synthesize_unified(
     if use_live:
         return await synthesize_gemini_live(req=req, app_settings=app_settings)
     return await synthesize_gemini_standard(req=req, app_settings=app_settings)
+
+
+@router.websocket("/transcribe/gemini")
+@router.websocket("/transcribe")
+async def transcribe_websocket(
+    websocket: WebSocket,
+    app_settings: Settings = Depends(get_settings),
+):
+    """Cognigy Voice Gateway Custom Speech WebSocket STT Endpoint.
+
+    Streams bidirectional real-time audio and transcription events:
+    1. Authenticates via Authorization: Bearer <API_KEY> on the WS connection handshake.
+    2. Receives initial JSON {"type": "start", "language": "...", "sampleRateHz": 8000, ...}.
+    3. Concurrently receives binary Linear16 PCM chunks and streams to Gemini 3.5 Transcribe Live.
+    4. Streams interim (is_final=False) and final (is_final=True) JSON transcription events to Cognigy.
+    5. Clean teardown upon receiving {"type": "stop"} or client disconnect.
+    """
+    # 1. Enforce API key authentication if configured
+    expected_key = app_settings.cognigy_api_key
+    if expected_key:
+        auth_header = websocket.headers.get("authorization", "")
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        if token != expected_key:
+            logger.warning("Rejected unauthorized WebSocket connection attempt")
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+    await websocket.accept()
+    logger.info("Cognigy Voice Gateway connected to STT WebSocket")
+
+    stt_client = GeminiSTTClient(app_settings)
+    live_session = None
+    session_ctx = None
+    audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
+    try:
+        # 2. Receive and parse initial "start" message
+        first_msg = await websocket.receive()
+        if "text" not in first_msg or not first_msg["text"]:
+            logger.warning("Expected initial JSON 'start' message, got binary or empty")
+            await websocket.send_json({"type": "error", "error": "Expected initial JSON start message"})
+            await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+            return
+
+        try:
+            start_payload = json.loads(first_msg["text"])
+        except Exception:
+            await websocket.send_json({"type": "error", "error": "Invalid JSON in start message"})
+            await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+            return
+
+        if start_payload.get("type") != "start":
+            await websocket.send_json({"type": "error", "error": f"Expected type 'start', got '{start_payload.get('type')}'"})
+            await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+            return
+
+        language = start_payload.get("language") or app_settings.transcribe_language
+        sample_rate_hz = int(start_payload.get("sampleRateHz") or app_settings.transcribe_sample_rate)
+        logger.info("Starting transcription session (lang=%s, rate=%d Hz)", language, sample_rate_hz)
+
+        # 3. Connect to upstream Gemini 3.5 Transcribe Live
+        live_session, session_ctx = await stt_client.connect_transcribe_session(
+            language=language,
+            sample_rate_hz=sample_rate_hz,
+        )
+
+        stop_event = asyncio.Event()
+
+        # Task A: Read binary audio chunks and control frames from Cognigy
+        async def cognigy_reader():
+            try:
+                while not stop_event.is_set():
+                    msg = await websocket.receive()
+                    msg_type = msg.get("type")
+
+                    if msg_type == "websocket.disconnect":
+                        logger.info("Cognigy WebSocket disconnected")
+                        break
+
+                    # Binary frame: Audio PCM chunk
+                    if "bytes" in msg and msg["bytes"]:
+                        await audio_queue.put(msg["bytes"])
+
+                    # Text frame: Control message (e.g. stop)
+                    elif "text" in msg and msg["text"]:
+                        try:
+                            ctrl = json.loads(msg["text"])
+                            if ctrl.get("type") == "stop":
+                                logger.info("Received 'stop' teardown signal from Cognigy Voice Gateway")
+                                stop_event.set()
+                                break
+                        except Exception as e:
+                            logger.warning("Error parsing Cognigy text frame: %s", e)
+            except WebSocketDisconnect:
+                logger.info("Cognigy Voice Gateway disconnected normally")
+            except Exception as e:
+                logger.error("Error in Cognigy reader: %s", e)
+            finally:
+                stop_event.set()
+
+        # Task B: Push audio PCM chunks to Gemini Live
+        async def gemini_audio_pusher():
+            try:
+                while not stop_event.is_set():
+                    try:
+                        chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
+                        await live_session.send_audio_chunk(chunk)
+                    except asyncio.TimeoutError:
+                        continue
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error in Gemini audio pusher: %s", e)
+            finally:
+                await live_session.send_stream_end()
+
+        # Task C: Stream transcription results back to Cognigy Voice Gateway
+        async def gemini_result_streamer():
+            try:
+                async for event in live_session.receive_events():
+                    if stop_event.is_set():
+                        break
+                    await websocket.send_json(event)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error streaming transcription results to Cognigy: %s", e)
+
+        # Run coordinated tasks
+        reader_task = asyncio.create_task(cognigy_reader())
+        pusher_task = asyncio.create_task(gemini_audio_pusher())
+        streamer_task = asyncio.create_task(gemini_result_streamer())
+
+        # Wait until reader ends (stop received or client disconnected)
+        await reader_task
+        stop_event.set()
+
+        # Cancel background pusher & streamer
+        pusher_task.cancel()
+        streamer_task.cancel()
+        await asyncio.gather(pusher_task, streamer_task, return_exceptions=True)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.exception("Error in transcription WebSocket handler: %s", e)
+        try:
+            await websocket.send_json({"type": "error", "error": str(e)})
+        except Exception:
+            pass
+    finally:
+        if live_session:
+            live_session.close()
+        if session_ctx:
+            try:
+                await session_ctx.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Error cleaning up Gemini Live session: %s", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        logger.info("Transcription session closed and cleaned up")
+

@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     standard_tts_model: str = "gemini-2.5-flash-tts"
     live_tts_model: str = "gemini-live-2.5-flash-native-audio"
 
+    # STT Model Configuration (Gemini 3.5 Transcribe Live in Europe)
+    transcribe_model: str = "gemini-3.5-transcribe-live"
+    transcribe_location: str = "eu"
+    transcribe_language: str = "en-US"
+    transcribe_sample_rate: int = 8000
+
     # Default Telephony Audio Settings
     default_voice: str = "Puck"
     default_sample_rate: int = 8000  # Telephony standard 8000 Hz

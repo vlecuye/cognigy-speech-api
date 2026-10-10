@@ -1,20 +1,21 @@
 # Cognigy Gemini Speech Adapter
 
-Custom speech (Text-to-Speech) adapter for **[Cognigy Voice Gateway (VG)](https://www.cognigy.com/platform/cognigy-voice-gateway)**, powered by Google Gemini 3.8 and the Gemini Live API.
+Unified custom speech (TTS and STT) adapter for **[Cognigy Voice Gateway (VG)](https://www.cognigy.com/platform/cognigy-voice-gateway)**, powered by Google Gemini speech synthesis and **Gemini 3.5 Transcribe Live**.
 
-This microservice implements the [Cognigy Custom Speech HTTP Contract](https://github.com/Cognigy/custom-speech-example) to deliver natural, human-like voice synthesis to telephony and contact center callers.
+This microservice implements the [Cognigy Custom Speech HTTP and WebSocket Contracts](https://github.com/Cognigy/custom-speech-example) to deliver natural voice generation and real-time streaming speech recognition to telephony and contact center callers.
 
 ---
 
-## Architecture & Modes
+## Architecture & Endpoints
 
-Cognigy Voice Gateway supports both **non-streaming** and **streaming** TTS over HTTP POST:
+Cognigy Voice Gateway communicates with this adapter via HTTP POST for speech synthesis and WebSocket for streaming transcription:
 
-| Mode | Endpoint | Backend Engine | Telephony Audio Output | Latency Profile |
+| Capability | Protocol | Endpoint | Backend Engine | Latency / Format |
 |---|---|---|---|---|
-| **Standard (Batch)** | `POST /synthesize/gemini` | `gemini-3.8-flash-tts` on Vertex AI | linear16 PCM @ 8000 Hz WAV (buffered) | Full synthesis buffer (~1–2s) |
-| **Streaming (Live)** | `POST /synthesize/gemini-live` | `gemini-3.1-flash-live-preview` (Live WebSocket API) | linear16 PCM @ 8000 Hz WAV (chunked HTTP stream) | **Sub-350ms Time-To-First-Byte** |
-| **Unified** | `POST /synthesize` | Dynamic dispatch (`?mode=live` or payload `stream: true`) | Auto-selected based on request | Flexible |
+| **STT (Streaming)** | WebSocket | `wss://<HOST>/transcribe/gemini` (or `/transcribe`) | `gemini-3.5-transcribe-live` on Vertex AI (`eu`) | Real-time interim & final transcripts; turns auto-detected |
+| **TTS (Streaming Live)** | HTTP POST | `POST /synthesize/gemini-live` | `gemini-live-2.5-flash-native-audio` (Live WebSocket API) | Chunked 8000 Hz Linear16 WAV (~300ms Time-To-First-Byte) |
+| **TTS (Standard Batch)** | HTTP POST | `POST /synthesize/gemini` | `gemini-2.5-flash-tts` on Vertex AI | Buffered 8000 Hz Linear16 WAV (~1s) |
+| **TTS (Unified)** | HTTP POST | `POST /synthesize` | Dynamic dispatch (`?mode=live` or payload `stream: true`) | Auto-selected based on request |
 
 ---
 
@@ -51,6 +52,31 @@ Cognigy Voice Gateway parses the 44-byte header and begins playing audio over th
 
 ---
 
+## The Cognigy Custom STT WebSocket Contract
+
+During a phone call, Cognigy Voice Gateway connects to the WebSocket endpoint:
+`wss://<YOUR_HOST>/transcribe/gemini`
+
+1. **Handshake Auth**: Voice Gateway passes `Authorization: Bearer <YOUR_API_KEY>` in upgrade headers.
+2. **Start Control Frame**: Voice Gateway sends JSON initialization:
+   ```json
+   {
+     "type": "start",
+     "language": "en-US",
+     "format": "raw",
+     "encoding": "LINEAR16",
+     "sampleRateHz": 8000,
+     "interimResults": true
+   }
+   ```
+3. **Audio Streaming**: Voice Gateway continuously streams raw Linear16 PCM binary frames (8kHz mono).
+4. **Transcription Delivery**: The adapter streams back JSON events:
+   - Partial hypotheses: `{"type": "transcription", "is_final": false, "alternatives": [{"transcript": "hello"}]}`
+   - Turn completion: `{"type": "transcription", "is_final": true, "alternatives": [{"confidence": 0.98, "transcript": "hello world"}]}`
+5. **Teardown**: Voice Gateway sends `{"type": "stop"}` when the turn completes.
+
+---
+
 ## Voices & Customization
 
 Standard prebuilt Gemini voices:
@@ -73,10 +99,13 @@ Environment variables (configure in `.env` or Cloud Run environment):
 | Variable | Description | Default |
 |---|---|---|
 | `PROJECT_ID` | Google Cloud Project ID (Vertex AI) | `all-in-demo` |
-| `LOCATION` | Vertex AI region | `global` |
+| `LOCATION` | Vertex AI region for TTS | `europe-west1` |
+| `TRANSCRIBE_LOCATION` | Vertex AI region for Gemini 3.5 Transcribe Live | `eu` (EU Multi-region) |
 | `COGNIGY_API_KEY` | Secret Bearer token expected from Cognigy VG | `None` (open if unset) |
-| `STANDARD_TTS_MODEL` | Standard Gemini TTS model | `gemini-3.8-flash-tts` |
-| `LIVE_TTS_MODEL` | Real-time Live API model | `gemini-3.1-flash-live-preview` |
+| `STANDARD_TTS_MODEL` | Standard Gemini TTS model | `gemini-2.5-flash-tts` |
+| `LIVE_TTS_MODEL` | Real-time Live API TTS model | `gemini-live-2.5-flash-native-audio` |
+| `TRANSCRIBE_MODEL` | Real-time Live API STT model | `gemini-3.5-transcribe-live` |
+| `TRANSCRIBE_LANGUAGE` | Default transcription language | `en-US` |
 | `DEFAULT_VOICE` | Default voice if omitted in request | `Puck` |
 | `DEFAULT_SAMPLE_RATE` | Default telephony sample rate | `8000` |
 | `PORT` | HTTP port | `8080` |
