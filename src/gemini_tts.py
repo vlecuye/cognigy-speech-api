@@ -23,11 +23,13 @@ class GeminiTTSClient:
                 self._client = self._client_factory()
             else:
                 from google import genai
-                self._client = genai.Client(
-                    enterprise=True,
-                    project=self.settings.project_id,
-                    location=self.settings.location,
-                )
+                client_kwargs = {
+                    "enterprise": True,
+                    "location": self.settings.location,
+                }
+                if self.settings.project_id:
+                    client_kwargs["project"] = self.settings.project_id
+                self._client = genai.Client(**client_kwargs)
         return self._client
 
     def synthesize_to_wav(

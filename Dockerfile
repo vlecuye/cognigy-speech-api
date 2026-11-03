@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8080
+    PORT=8080 \
+    LOG_LEVEL=info
 
 WORKDIR /app
 
@@ -17,4 +18,5 @@ COPY src/ ./src/
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "uvicorn src.app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn src.app:app --host 0.0.0.0 --port ${PORT} --log-level ${LOG_LEVEL:-info}"]
+
