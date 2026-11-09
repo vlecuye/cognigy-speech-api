@@ -33,28 +33,10 @@ class LiveSTTSession:
         )
 
     async def send_audio_chunk(self, pcm_chunk: bytes):
-        """Send raw linear16 PCM audio chunk to Gemini Live once ready."""
+        """Send raw linear16 PCM audio chunk to Gemini Live immediately."""
         if self._closed or not pcm_chunk:
             return
         from google.genai import types
-
-        # If session is not ready yet, wait with a safeguard timeout to avoid deadlocks
-        if not self.ready_event.is_set():
-            logger.info(
-                "[GCP-STT] [%s] Waiting for session ready_event before sending chunk #%d (%d bytes)...",
-                self.session_id,
-                self._chunks_sent + 1,
-                len(pcm_chunk),
-            )
-            try:
-                await asyncio.wait_for(self.ready_event.wait(), timeout=3.0)
-                logger.info("[GCP-STT] [%s] ready_event unblocked! Proceeding with audio send.", self.session_id)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[GCP-STT] [%s] ready_event timed out after 3.0s! Unblocking audio push anyway to avoid deadlock.",
-                    self.session_id,
-                )
-                self.ready_event.set()
 
         try:
             t_chunk_start = time.perf_counter()
